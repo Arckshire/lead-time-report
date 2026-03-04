@@ -43,11 +43,6 @@ DISPLAY_COLS = {
 # File ingest (robust encoding + excel)
 # ----------------------------
 def _read_input(uploaded_file) -> pd.DataFrame:
-    """
-    Robust reader:
-      - CSV: tries multiple encodings
-      - Excel: reads first sheet
-    """
     name = uploaded_file.name.lower()
 
     if name.endswith(".csv"):
@@ -76,12 +71,6 @@ def _read_input(uploaded_file) -> pd.DataFrame:
 # Datetime handling (tz-aware vs tz-naive)
 # ----------------------------
 def _coerce_datetimes(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """
-    Coerce timestamp columns into a consistent tz-naive datetime dtype.
-
-    Fixes:
-      'Cannot compare tz-naive and tz-aware timestamps'
-    """
     for c in cols:
         if c in df.columns:
             s = pd.to_datetime(df[c], errors="coerce", utc=True)
@@ -90,10 +79,6 @@ def _coerce_datetimes(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 
 
 def _resolve_timestamp(row: pd.Series, milestone: str) -> pd.Timestamp:
-    """
-    Resolve milestone timestamp with fallback only for VDL/VAD.
-    Prefer carrier milestone over P44 fallback.
-    """
     val = row.get(milestone, pd.NaT)
     if pd.notna(val):
         return val
@@ -110,9 +95,6 @@ def _round_hours(x: Optional[float]) -> Optional[float]:
 
 
 def _round_days_from_hours(x_hours: Optional[float]) -> Optional[int]:
-    """
-    Days must be clean integers (no decimals).
-    """
     if x_hours is None or (isinstance(x_hours, float) and np.isnan(x_hours)):
         return None
     return int(np.round(x_hours / 24.0))
@@ -140,20 +122,12 @@ def compute_shipment_leadtimes(
     end_ms: str,
     shipment_agg: str,  # "Earliest" or "Latest"
 ) -> pd.DataFrame:
-    """
-    Container-level qualification -> container lead time -> shipment-level aggregation.
-
-    Returns one row per:
-      TENANT_NAME, POL, POD, CARRIER_NAME, CARRIER_SCAC, MASTER_SHIPMENT_ID
-    with LEAD_TIME_HOURS and LANE.
-    """
     df = raw.copy()
 
     missing = [c for c in REQUIRED_BASE_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(missing)}")
 
-    # Datetime columns needed (include fallbacks if relevant)
     dt_cols = [start_ms, end_ms]
     for ms in [start_ms, end_ms]:
         if ms in P44_FALLBACKS:
@@ -161,15 +135,12 @@ def compute_shipment_leadtimes(
     dt_cols = list(dict.fromkeys(dt_cols))
     df = _coerce_datetimes(df, dt_cols)
 
-    # Resolve timestamps per container row
     df["_START_TS"] = df.apply(lambda r: _resolve_timestamp(r, start_ms), axis=1)
     df["_END_TS"] = df.apply(lambda r: _resolve_timestamp(r, end_ms), axis=1)
 
-    # Normalize resolved columns too (handles mixed types)
     df["_START_TS"] = pd.to_datetime(df["_START_TS"], errors="coerce", utc=True).dt.tz_convert(None)
     df["_END_TS"] = pd.to_datetime(df["_END_TS"], errors="coerce", utc=True).dt.tz_convert(None)
 
-    # Qualification
     df["_QUALIFIED"] = (
         pd.notna(df["_START_TS"]) & pd.notna(df["_END_TS"]) & (df["_END_TS"] >= df["_START_TS"])
     )
@@ -195,7 +166,6 @@ def compute_shipment_leadtimes(
         .reset_index()
         .rename(columns={"_LEAD_HOURS": "LEAD_TIME_HOURS"})
     )
-
     ship["LANE"] = ship.apply(lambda r: _make_lane(r["POL"], r["POD"]), axis=1)
     return ship
 
@@ -241,11 +211,6 @@ def build_carrier_lane_report(
     include_percentile: bool,
     min_volume_for_percentile: int,
 ) -> pd.DataFrame:
-    """
-    For each lane:
-      - lane summary row (ALL CARRIERS) with lane name filled (bold later)
-      - carrier rows below with lane column blank
-    """
     cols = [
         "TENANT_NAME",
         "LANE",
@@ -268,66 +233,47 @@ def build_carrier_lane_report(
     if shipment_lt.empty:
         return pd.DataFrame(columns=cols)
 
-    # Lane stats (ALL carriers combined)
     lane_cols = ["TENANT_NAME", "POL", "POD", "LANE"]
     lane_stats = (
         shipment_lt.groupby(lane_cols, dropna=False)
-        .apply(
-            lambda g: pd.Series(
-                _stats_from_group(
-                    g["LEAD_TIME_HOURS"], percentile_p, include_percentile, min_volume_for_percentile
-                )
-            )
-        )
+        .apply(lambda g: pd.Series(_stats_from_group(g["LEAD_TIME_HOURS"], percentile_p, include_percentile, min_volume_for_percentile)))
         .reset_index()
     )
     lane_stats["CARRIER_NAME"] = "ALL CARRIERS"
     lane_stats["CARRIER_SCAC"] = ""
 
-    # Carrier stats
     carrier_cols = ["TENANT_NAME", "POL", "POD", "LANE", "CARRIER_NAME", "CARRIER_SCAC"]
     carrier_stats = (
         shipment_lt.groupby(carrier_cols, dropna=False)
-        .apply(
-            lambda g: pd.Series(
-                _stats_from_group(
-                    g["LEAD_TIME_HOURS"], percentile_p, include_percentile, min_volume_for_percentile
-                )
-            )
-        )
+        .apply(lambda g: pd.Series(_stats_from_group(g["LEAD_TIME_HOURS"], percentile_p, include_percentile, min_volume_for_percentile)))
         .reset_index()
     )
 
-    # Order lanes by volume desc
     lane_stats = lane_stats.sort_values(["TENANT_NAME", "VOLUME", "LANE"], ascending=[True, False, True])
 
     rows = []
     for _, lr in lane_stats.iterrows():
         tenant, lane, pol, pod = lr["TENANT_NAME"], lr["LANE"], lr["POL"], lr["POD"]
 
-        # Lane summary row (lane present)
-        rows.append(
-            {
-                "TENANT_NAME": tenant,
-                "LANE": lane,
-                "CARRIER_NAME": lr["CARRIER_NAME"],
-                "CARRIER_SCAC": lr["CARRIER_SCAC"],
-                "VOLUME": lr["VOLUME"],
-                "TOTAL_H": lr["TOTAL_H"],
-                "TOTAL_D": lr["TOTAL_D"],
-                "MED_H": lr["MED_H"],
-                "MED_D": lr["MED_D"],
-                "PCT_H": lr["PCT_H"],
-                "PCT_D": lr["PCT_D"],
-                "MAX_H": lr["MAX_H"],
-                "MAX_D": lr["MAX_D"],
-                "_IS_LANE_ROW": True,
-                "_POL": pol,
-                "_POD": pod,
-            }
-        )
+        rows.append({
+            "TENANT_NAME": tenant,
+            "LANE": lane,
+            "CARRIER_NAME": lr["CARRIER_NAME"],
+            "CARRIER_SCAC": lr["CARRIER_SCAC"],
+            "VOLUME": lr["VOLUME"],
+            "TOTAL_H": lr["TOTAL_H"],
+            "TOTAL_D": lr["TOTAL_D"],
+            "MED_H": lr["MED_H"],
+            "MED_D": lr["MED_D"],
+            "PCT_H": lr["PCT_H"],
+            "PCT_D": lr["PCT_D"],
+            "MAX_H": lr["MAX_H"],
+            "MAX_D": lr["MAX_D"],
+            "_IS_LANE_ROW": True,
+            "_POL": pol,
+            "_POD": pod,
+        })
 
-        # Carrier rows under lane (lane blank)
         csub = carrier_stats[
             (carrier_stats["TENANT_NAME"] == tenant)
             & (carrier_stats["POL"].astype(str) == str(pol))
@@ -335,51 +281,45 @@ def build_carrier_lane_report(
         ].sort_values(["VOLUME", "CARRIER_NAME"], ascending=[False, True])
 
         for _, cr in csub.iterrows():
-            rows.append(
-                {
-                    "TENANT_NAME": tenant,
-                    "LANE": "",
-                    "CARRIER_NAME": cr["CARRIER_NAME"],
-                    "CARRIER_SCAC": cr["CARRIER_SCAC"],
-                    "VOLUME": cr["VOLUME"],
-                    "TOTAL_H": cr["TOTAL_H"],
-                    "TOTAL_D": cr["TOTAL_D"],
-                    "MED_H": cr["MED_H"],
-                    "MED_D": cr["MED_D"],
-                    "PCT_H": cr["PCT_H"],
-                    "PCT_D": cr["PCT_D"],
-                    "MAX_H": cr["MAX_H"],
-                    "MAX_D": cr["MAX_D"],
-                    "_IS_LANE_ROW": False,
-                    "_POL": pol,
-                    "_POD": pod,
-                }
-            )
+            rows.append({
+                "TENANT_NAME": tenant,
+                "LANE": "",
+                "CARRIER_NAME": cr["CARRIER_NAME"],
+                "CARRIER_SCAC": cr["CARRIER_SCAC"],
+                "VOLUME": cr["VOLUME"],
+                "TOTAL_H": cr["TOTAL_H"],
+                "TOTAL_D": cr["TOTAL_D"],
+                "MED_H": cr["MED_H"],
+                "MED_D": cr["MED_D"],
+                "PCT_H": cr["PCT_H"],
+                "PCT_D": cr["PCT_D"],
+                "MAX_H": cr["MAX_H"],
+                "MAX_D": cr["MAX_D"],
+                "_IS_LANE_ROW": False,
+                "_POL": pol,
+                "_POD": pod,
+            })
 
     return pd.DataFrame(rows, columns=cols)
 
 
 # ----------------------------
-# Excel output (openpyxl only)
+# Excel output (openpyxl only) — FIXED for Excel Online
 # ----------------------------
 def write_excel(raw_df: pd.DataFrame, report_df: pd.DataFrame, percentile_p: int) -> bytes:
     """
-    Excel output:
-      - Raw Data
-      - Carrier Lane Lead (clean headers + bold lane cell on lane rows)
-
-    Uses openpyxl only (no xlsxwriter dependency).
+    Uses openpyxl only and writes the workbook ONCE (important for Excel Online compatibility).
     """
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
     output = io.BytesIO()
 
+    # IMPORTANT: do NOT call writer.book.save() inside the context manager.
+    # Let pandas close the writer once to produce a valid .xlsx.
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # Sheet 1: Raw Data
         raw_df.to_excel(writer, sheet_name="Raw Data", index=False)
 
-        # Sheet 2: Carrier Lane Lead
         if report_df.empty:
             empty_cols = [
                 DISPLAY_COLS["TENANT_NAME"],
@@ -397,59 +337,57 @@ def write_excel(raw_df: pd.DataFrame, report_df: pd.DataFrame, percentile_p: int
                 DISPLAY_COLS["MAX_D"],
             ]
             pd.DataFrame(columns=empty_cols).to_excel(writer, sheet_name="Carrier Lane Lead", index=False)
-            writer.book.save(output)
-            return output.getvalue()
+            # formatting not needed for empty; still valid workbook
+        else:
+            df = report_df.copy()
+            lane_flags = df["_IS_LANE_ROW"].astype(bool).to_list()
+            df = df.drop(columns=["_IS_LANE_ROW", "_POL", "_POD"])
 
-        df = report_df.copy()
-        lane_flags = df["_IS_LANE_ROW"].astype(bool).to_list()
-        df = df.drop(columns=["_IS_LANE_ROW", "_POL", "_POD"])
+            export_cols = {
+                "TENANT_NAME": DISPLAY_COLS["TENANT_NAME"],
+                "LANE": DISPLAY_COLS["LANE"],
+                "CARRIER_NAME": DISPLAY_COLS["CARRIER_NAME"],
+                "CARRIER_SCAC": DISPLAY_COLS["CARRIER_SCAC"],
+                "VOLUME": DISPLAY_COLS["VOLUME"],
+                "TOTAL_H": DISPLAY_COLS["TOTAL_H"],
+                "TOTAL_D": DISPLAY_COLS["TOTAL_D"],
+                "MED_H": DISPLAY_COLS["MED_H"],
+                "MED_D": DISPLAY_COLS["MED_D"],
+                "PCT_H": DISPLAY_COLS["PCT_H"].format(p=percentile_p),
+                "PCT_D": DISPLAY_COLS["PCT_D"].format(p=percentile_p),
+                "MAX_H": DISPLAY_COLS["MAX_H"],
+                "MAX_D": DISPLAY_COLS["MAX_D"],
+            }
 
-        export_cols = {
-            "TENANT_NAME": DISPLAY_COLS["TENANT_NAME"],
-            "LANE": DISPLAY_COLS["LANE"],
-            "CARRIER_NAME": DISPLAY_COLS["CARRIER_NAME"],
-            "CARRIER_SCAC": DISPLAY_COLS["CARRIER_SCAC"],
-            "VOLUME": DISPLAY_COLS["VOLUME"],
-            "TOTAL_H": DISPLAY_COLS["TOTAL_H"],
-            "TOTAL_D": DISPLAY_COLS["TOTAL_D"],
-            "MED_H": DISPLAY_COLS["MED_H"],
-            "MED_D": DISPLAY_COLS["MED_D"],
-            "PCT_H": DISPLAY_COLS["PCT_H"].format(p=percentile_p),
-            "PCT_D": DISPLAY_COLS["PCT_D"].format(p=percentile_p),
-            "MAX_H": DISPLAY_COLS["MAX_H"],
-            "MAX_D": DISPLAY_COLS["MAX_D"],
-        }
+            df = df[list(export_cols.keys())].rename(columns=export_cols)
+            df.to_excel(writer, sheet_name="Carrier Lane Lead", index=False)
 
-        df = df[list(export_cols.keys())].rename(columns=export_cols)
-        df.to_excel(writer, sheet_name="Carrier Lane Lead", index=False)
+            ws = writer.book["Carrier Lane Lead"]
+            bold_font = Font(bold=True)
 
-        # Formatting
-        ws = writer.book["Carrier Lane Lead"]
-        bold_font = Font(bold=True)
+            # Header bold
+            for cell in ws[1]:
+                cell.font = bold_font
 
-        # Header bold
-        for cell in ws[1]:
-            cell.font = bold_font
+            # Bold only the lane cell for lane rows
+            lane_col_idx = list(df.columns).index(DISPLAY_COLS["LANE"]) + 1
+            for i, is_lane in enumerate(lane_flags, start=2):
+                if is_lane:
+                    ws.cell(row=i, column=lane_col_idx).font = bold_font
 
-        # Bold only the lane cell for lane rows
-        lane_col_idx = list(df.columns).index(DISPLAY_COLS["LANE"]) + 1  # 1-based in openpyxl
-        for i, is_lane in enumerate(lane_flags, start=2):  # start=2 because row 1 is header
-            if is_lane:
-                ws.cell(row=i, column=lane_col_idx).font = bold_font
+            # Column widths
+            width_map = {
+                DISPLAY_COLS["TENANT_NAME"]: 22,
+                DISPLAY_COLS["LANE"]: 28,
+                DISPLAY_COLS["CARRIER_NAME"]: 28,
+                DISPLAY_COLS["CARRIER_SCAC"]: 14,
+                DISPLAY_COLS["VOLUME"]: 18,
+            }
+            for idx, col_name in enumerate(df.columns, start=1):
+                ws.column_dimensions[get_column_letter(idx)].width = width_map.get(col_name, 22)
 
-        # Column widths (simple heuristic)
-        width_map = {
-            DISPLAY_COLS["TENANT_NAME"]: 22,
-            DISPLAY_COLS["LANE"]: 28,
-            DISPLAY_COLS["CARRIER_NAME"]: 28,
-            DISPLAY_COLS["CARRIER_SCAC"]: 14,
-            DISPLAY_COLS["VOLUME"]: 18,
-        }
-        for idx, col_name in enumerate(df.columns, start=1):
-            ws.column_dimensions[get_column_letter(idx)].width = width_map.get(col_name, 22)
-
-        writer.book.save(output)
-
+    # IMPORTANT: rewind before reading bytes (extra-safe for some hosts)
+    output.seek(0)
     return output.getvalue()
 
 
@@ -480,7 +418,6 @@ except Exception as e:
 
 st.success(f"Loaded {raw_df.shape[0]:,} rows × {raw_df.shape[1]:,} columns")
 
-# Sidebar controls
 st.sidebar.header("Journey Settings")
 start_ms = st.sidebar.selectbox(
     "Journey start milestone",
@@ -530,7 +467,6 @@ min_volume = st.sidebar.number_input(
 
 min_volume_for_pct = int(min_volume) if (include_percentile and limit_by_volume) else 0
 
-# Compute shipment-level lead times
 try:
     shipment_lt = compute_shipment_leadtimes(
         raw=raw_df,
@@ -542,7 +478,6 @@ except Exception as e:
     st.error(f"Error computing lead times: {e}")
     st.stop()
 
-# Metrics
 total_shipments = raw_df["MASTER_SHIPMENT_ID"].nunique() if "MASTER_SHIPMENT_ID" in raw_df.columns else None
 eligible_shipments = shipment_lt["MASTER_SHIPMENT_ID"].nunique() if not shipment_lt.empty else 0
 coverage = (eligible_shipments / total_shipments * 100.0) if total_shipments else 0.0
@@ -553,10 +488,8 @@ c2.metric("Eligible Shipments (lead time computed)", f"{eligible_shipments:,}")
 c3.metric("Coverage", f"{coverage:.1f}%")
 
 st.subheader("Shipment-level lead times (preview)")
-st.caption("One row per Tenant + Lane + Carrier + Master Shipment ID (after container qualification & shipment aggregation).")
 st.dataframe(shipment_lt.head(200), use_container_width=True)
 
-# Build report
 report_df = build_carrier_lane_report(
     shipment_lt=shipment_lt,
     percentile_p=int(percentile_p),
@@ -570,7 +503,6 @@ st.dataframe(
     use_container_width=True,
 )
 
-# Export
 excel_bytes = write_excel(raw_df=raw_df, report_df=report_df, percentile_p=int(percentile_p))
 st.download_button(
     label="Download Excel Report",
