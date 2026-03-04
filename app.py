@@ -144,7 +144,7 @@ def compute_shipment_leadtimes(
     raw: pd.DataFrame,
     start_ms: str,
     end_ms: str,
-    shipment_agg: str,  # "Earliest" or "Latest" lead time per shipment
+    shipment_agg: str,  # "Earliest" or "Latest"
 ) -> pd.DataFrame:
     """
     Container-level qualification -> container lead time -> shipment-level aggregation.
@@ -181,11 +181,11 @@ def compute_shipment_leadtimes(
         pd.notna(df["_START_TS"]) & pd.notna(df["_END_TS"]) & (df["_END_TS"] >= df["_START_TS"])
     )
 
-    # Lead time in hours at container level
-    df["_LEAD_HOURS"] = np.where(
-        df["_QUALIFIED"],
-        (df["_END_TS"] - df["_START_TS"]).astype("timedelta64[s]") / 3600.0,
-        np.nan,
+    # ✅ SAFE lead time computation (float hours) — avoids timedelta/float dtype promotion error
+    df["_LEAD_HOURS"] = np.nan
+    valid_mask = df["_QUALIFIED"]
+    df.loc[valid_mask, "_LEAD_HOURS"] = (
+        (df.loc[valid_mask, "_END_TS"] - df.loc[valid_mask, "_START_TS"]).dt.total_seconds() / 3600.0
     )
 
     # Shipment-level aggregation within tenant+lane+carrier+master shipment
