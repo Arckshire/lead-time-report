@@ -1,8 +1,11 @@
+# app.py
 import io
 from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -50,6 +53,8 @@ DISPLAY_COLS = {
     "MAX_D": "Max Lead Time (Days)",
 }
 
+DEFAULT_RECOMMENDATION_THRESHOLD = 0
+
 
 # ----------------------------
 # File ingest
@@ -90,15 +95,11 @@ def get_missing_columns(
 ) -> List[str]:
     missing = []
 
-    # Required base columns
     for col in REQUIRED_BASE_COLS:
         if col not in df.columns:
             missing.append(col)
 
-    # Validate selected milestones for normal mode
     selected_milestones = {start_ms, end_ms}
-
-    # Whole journey needs the full chain
     if whole_journey:
         selected_milestones.update(ORDERED_MILESTONES)
 
@@ -168,6 +169,10 @@ def _segment_label(start_ms: str, end_ms: str) -> str:
     return f"{start_ms}-{end_ms}"
 
 
+def _journey_col_name() -> str:
+    return "JOURNEY_LEAD_HOURS"
+
+
 # ----------------------------
 # Raw export prep
 # ----------------------------
@@ -182,18 +187,12 @@ def add_shipment_month_year(raw_df: pd.DataFrame) -> pd.DataFrame:
         df[f"_RES_{ms}"] = df.apply(lambda r: _resolve_timestamp(r, ms), axis=1)
         df[f"_RES_{ms}"] = pd.to_datetime(df[f"_RES_{ms}"], errors="coerce", utc=True).dt.tz_convert(None)
 
-    resolved_cols = [f"_RES_{ms}" for ms in ORDERED_MILESTONES]
-    first_ts = None
-    for col in resolved_cols:
-        if first_ts is None:
-            first_ts = df[col]
-        else:
-            first_ts = first_ts.fillna(df[col])
+    first_ts = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    for ms in ORDERED_MILESTONES:
+        first_ts = first_ts.fillna(df[f"_RES_{ms}"])
 
-    df["SHIPMENT_MONTH_YEAR"] = first_ts.dt.strftime("%b %Y")
-    df["SHIPMENT_MONTH_YEAR"] = df["SHIPMENT_MONTH_YEAR"].fillna("")
-
-    df = df.drop(columns=resolved_cols, errors="ignore")
+    df["SHIPMENT_MONTH_YEAR"] = first_ts.dt.strftime("%b %Y").fillna("")
+    df = df.drop(columns=[f"_RES_{ms}" for ms in ORDERED_MILESTONES], errors="ignore")
     return df
 
 
@@ -213,7 +212,6 @@ def compute_shipment_leadtimes(
     dt_cols = list(dict.fromkeys(dt_cols))
     df = _coerce_datetimes(df, dt_cols)
 
-    # Resolve all milestone timestamps once
     for ms in ORDERED_MILESTONES:
         df[f"_RES_{ms}"] = df.apply(lambda r: _resolve_timestamp(r, ms), axis=1)
         df[f"_RES_{ms}"] = pd.to_datetime(df[f"_RES_{ms}"], errors="coerce", utc=True).dt.tz_convert(None)
@@ -224,29 +222,26 @@ def compute_shipment_leadtimes(
     group_cols = ["TENANT_NAME", "POL", "POD", "CARRIER_NAME", "CARRIER_SCAC", "MASTER_SHIPMENT_ID"]
 
     if whole_journey:
-        # Must have all resolved milestones present
         all_present_mask = pd.Series(True, index=df.index)
         for ms in ORDERED_MILESTONES:
             all_present_mask = all_present_mask & pd.notna(df[f"_RES_{ms}"])
 
-        # Every consecutive segment must be ordered correctly
         ordered_mask = pd.Series(True, index=df.index)
         for a, b in SEGMENTS:
             ordered_mask = ordered_mask & (df[f"_RES_{b}"] >= df[f"_RES_{a}"])
 
-        # Selected journey must also be ordered correctly
         selected_mask = pd.notna(df["_START_TS"]) & pd.notna(df["_END_TS"]) & (df["_END_TS"] >= df["_START_TS"])
 
         df["_WHOLE_VALID"] = all_present_mask & ordered_mask & selected_mask
         qdf = df[df["_WHOLE_VALID"]].copy()
 
         if qdf.empty:
-            return pd.DataFrame(columns=group_cols + ["LANE", "JOURNEY_LEAD_HOURS"] + [_segment_col_name(a, b) for a, b in SEGMENTS])
+            return pd.DataFrame(
+                columns=group_cols + ["LANE", _journey_col_name()] + [_segment_col_name(a, b) for a, b in SEGMENTS]
+            )
 
-        # Compute selected journey duration
-        qdf["JOURNEY_LEAD_HOURS"] = (qdf["_END_TS"] - qdf["_START_TS"]).dt.total_seconds() / 3600.0
+        qdf[_journey_col_name()] = (qdf["_END_TS"] - qdf["_START_TS"]).dt.total_seconds() / 3600.0
 
-        # Compute all segment durations
         segment_cols = []
         for a, b in SEGMENTS:
             col = _segment_col_name(a, b)
@@ -254,20 +249,19 @@ def compute_shipment_leadtimes(
             segment_cols.append(col)
 
         agg_fn = "min" if shipment_agg.lower().startswith("ear") else "max"
-        ship = qdf.groupby(group_cols, dropna=False)[["JOURNEY_LEAD_HOURS"] + segment_cols].agg(agg_fn).reset_index()
+        ship = qdf.groupby(group_cols, dropna=False)[[_journey_col_name()] + segment_cols].agg(agg_fn).reset_index()
         ship["LANE"] = ship.apply(lambda r: _make_lane(r["POL"], r["POD"]), axis=1)
         return ship
 
-    # Normal mode
     df["_QUALIFIED"] = pd.notna(df["_START_TS"]) & pd.notna(df["_END_TS"]) & (df["_END_TS"] >= df["_START_TS"])
     qdf = df[df["_QUALIFIED"]].copy()
 
     if qdf.empty:
-        return pd.DataFrame(columns=group_cols + ["LANE", "JOURNEY_LEAD_HOURS"])
+        return pd.DataFrame(columns=group_cols + ["LANE", _journey_col_name()])
 
-    qdf["JOURNEY_LEAD_HOURS"] = (qdf["_END_TS"] - qdf["_START_TS"]).dt.total_seconds() / 3600.0
+    qdf[_journey_col_name()] = (qdf["_END_TS"] - qdf["_START_TS"]).dt.total_seconds() / 3600.0
     agg_fn = "min" if shipment_agg.lower().startswith("ear") else "max"
-    ship = qdf.groupby(group_cols, dropna=False)[["JOURNEY_LEAD_HOURS"]].agg(agg_fn).reset_index()
+    ship = qdf.groupby(group_cols, dropna=False)[[_journey_col_name()]].agg(agg_fn).reset_index()
     ship["LANE"] = ship.apply(lambda r: _make_lane(r["POL"], r["POD"]), axis=1)
     return ship
 
@@ -293,12 +287,14 @@ def compute_lane_and_carrier_counts(shipment_lt: pd.DataFrame) -> Tuple[pd.DataF
         shipment_lt.groupby(["TENANT_NAME", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)["MASTER_SHIPMENT_ID"]
         .nunique()
         .reset_index()
-        .rename(columns={
-            "TENANT_NAME": "Tenant Name",
-            "CARRIER_NAME": "Carrier Name",
-            "CARRIER_SCAC": "Carrier SCAC",
-            "MASTER_SHIPMENT_ID": "Shipments",
-        })
+        .rename(
+            columns={
+                "TENANT_NAME": "Tenant Name",
+                "CARRIER_NAME": "Carrier Name",
+                "CARRIER_SCAC": "Carrier SCAC",
+                "MASTER_SHIPMENT_ID": "Shipments",
+            }
+        )
         .sort_values(["Shipments", "Carrier Name"], ascending=[False, True])
     )
 
@@ -323,8 +319,7 @@ def apply_top_n_lanes_filter(shipment_lt: pd.DataFrame, top_n_lanes: int) -> pd.
         .drop_duplicates()
     )
 
-    filtered = shipment_lt.merge(top_lanes, on=["TENANT_NAME", "LANE"], how="inner")
-    return filtered
+    return shipment_lt.merge(top_lanes, on=["TENANT_NAME", "LANE"], how="inner")
 
 
 # ----------------------------
@@ -381,7 +376,7 @@ def _stats_for_series(
 def build_duration_configs(start_ms: str, end_ms: str, whole_journey: bool) -> List[Dict[str, str]]:
     configs = [
         {
-            "data_col": "JOURNEY_LEAD_HOURS",
+            "data_col": _journey_col_name(),
             "prefix": "JOURNEY",
             "label": f"{start_ms}-{end_ms}",
             "display_mode": "journey",
@@ -390,12 +385,14 @@ def build_duration_configs(start_ms: str, end_ms: str, whole_journey: bool) -> L
 
     if whole_journey:
         for a, b in SEGMENTS:
-            configs.append({
-                "data_col": _segment_col_name(a, b),
-                "prefix": f"SEG_{a}_{b}",
-                "label": _segment_label(a, b),
-                "display_mode": "segment",
-            })
+            configs.append(
+                {
+                    "data_col": _segment_col_name(a, b),
+                    "prefix": f"SEG_{a}_{b}",
+                    "label": _segment_label(a, b),
+                    "display_mode": "segment",
+                }
+            )
 
     return configs
 
@@ -435,13 +432,20 @@ def build_carrier_lane_report(
     metric_cols = []
     for cfg in duration_configs:
         pfx = cfg["prefix"]
-        metric_cols.extend([
-            f"{pfx}_TOTAL_H", f"{pfx}_TOTAL_D",
-            f"{pfx}_MIN_H", f"{pfx}_MIN_D",
-            f"{pfx}_MED_H", f"{pfx}_MED_D",
-            f"{pfx}_PCT_H", f"{pfx}_PCT_D",
-            f"{pfx}_MAX_H", f"{pfx}_MAX_D",
-        ])
+        metric_cols.extend(
+            [
+                f"{pfx}_TOTAL_H",
+                f"{pfx}_TOTAL_D",
+                f"{pfx}_MIN_H",
+                f"{pfx}_MIN_D",
+                f"{pfx}_MED_H",
+                f"{pfx}_MED_D",
+                f"{pfx}_PCT_H",
+                f"{pfx}_PCT_D",
+                f"{pfx}_MAX_H",
+                f"{pfx}_MAX_D",
+            ]
+        )
 
     cols = base_cols + metric_cols
 
@@ -470,7 +474,7 @@ def build_carrier_lane_report(
     for _, lr in lane_stats.iterrows():
         tenant, lane, pol, pod = lr["TENANT_NAME"], lr["LANE"], lr["POL"], lr["POD"]
 
-        row = {
+        lane_row = {
             "TENANT_NAME": tenant,
             "LANE": lane,
             "CARRIER_NAME": lr["CARRIER_NAME"],
@@ -481,8 +485,8 @@ def build_carrier_lane_report(
             "_POD": pod,
         }
         for mc in metric_cols:
-            row[mc] = lr.get(mc)
-        rows.append(row)
+            lane_row[mc] = lr.get(mc)
+        rows.append(lane_row)
 
         csub = carrier_stats[
             (carrier_stats["TENANT_NAME"] == tenant)
@@ -491,7 +495,7 @@ def build_carrier_lane_report(
         ].sort_values(["VOLUME", "CARRIER_NAME"], ascending=[False, True])
 
         for _, cr in csub.iterrows():
-            row = {
+            carrier_row = {
                 "TENANT_NAME": tenant,
                 "LANE": "",
                 "CARRIER_NAME": cr["CARRIER_NAME"],
@@ -502,10 +506,253 @@ def build_carrier_lane_report(
                 "_POD": pod,
             }
             for mc in metric_cols:
-                row[mc] = cr.get(mc)
-            rows.append(row)
+                carrier_row[mc] = cr.get(mc)
+            rows.append(carrier_row)
 
     return pd.DataFrame(rows, columns=cols)
+
+
+# ----------------------------
+# Insights
+# ----------------------------
+def build_insight_options(duration_configs: List[Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+    return {cfg["label"]: cfg for cfg in duration_configs}
+
+
+def compute_insights_for_metric(
+    shipment_lt: pd.DataFrame,
+    metric_cfg: Dict[str, str],
+    percentile_p: int,
+    percentile_threshold_enabled: bool,
+    percentile_threshold_value: int,
+    rec_threshold_enabled: bool,
+    rec_threshold_value: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      lane_summary_df
+      carrier_recommendations_df
+    """
+    metric_col = metric_cfg["data_col"]
+
+    if shipment_lt.empty or metric_col not in shipment_lt.columns:
+        lane_summary = pd.DataFrame(
+            columns=["TENANT_NAME", "LANE", "LANE_SHIPMENTS", "LANE_MEDIAN_H", "LANE_MEDIAN_D", "LANE_PXX_H", "LANE_PXX_D", "CARRIER_COUNT"]
+        )
+        carrier_recs = pd.DataFrame(
+            columns=[
+                "TENANT_NAME",
+                "LANE",
+                "CARRIER_NAME",
+                "CARRIER_SCAC",
+                "SHIPMENTS",
+                "CARRIER_MEDIAN_H",
+                "CARRIER_MEDIAN_D",
+                "CARRIER_PXX_H",
+                "CARRIER_PXX_D",
+                "MEDIAN_ABS_DEV_H",
+                "MEDIAN_ABS_DEV_D",
+                "PXX_ABS_DEV_H",
+                "PXX_ABS_DEV_D",
+                "RANK_IN_LANE",
+                "RECOMMENDATION_ELIGIBLE",
+            ]
+        )
+        return lane_summary, carrier_recs
+
+    valid = shipment_lt.dropna(subset=[metric_col]).copy()
+    if valid.empty:
+        return compute_insights_for_metric(
+            pd.DataFrame(columns=shipment_lt.columns),
+            metric_cfg,
+            percentile_p,
+            percentile_threshold_enabled,
+            percentile_threshold_value,
+            rec_threshold_enabled,
+            rec_threshold_value,
+        )
+
+    lane_base = (
+        valid.groupby(["TENANT_NAME", "LANE"], dropna=False)
+        .agg(
+            LANE_SHIPMENTS=("MASTER_SHIPMENT_ID", "nunique"),
+            LANE_MEDIAN_H=(metric_col, "median"),
+            CARRIER_COUNT=("CARRIER_NAME", "nunique"),
+        )
+        .reset_index()
+    )
+
+    if percentile_threshold_enabled:
+        lane_base["LANE_PXX_H"] = lane_base.apply(
+            lambda r: _safe_quantile(
+                valid[(valid["TENANT_NAME"] == r["TENANT_NAME"]) & (valid["LANE"] == r["LANE"])][metric_col],
+                percentile_p / 100.0,
+            )
+            if r["LANE_SHIPMENTS"] >= percentile_threshold_value
+            else None,
+            axis=1,
+        )
+    else:
+        lane_base["LANE_PXX_H"] = lane_base.apply(
+            lambda r: _safe_quantile(
+                valid[(valid["TENANT_NAME"] == r["TENANT_NAME"]) & (valid["LANE"] == r["LANE"])][metric_col],
+                percentile_p / 100.0,
+            ),
+            axis=1,
+        )
+
+    lane_base["LANE_MEDIAN_H"] = lane_base["LANE_MEDIAN_H"].apply(_round_hours)
+    lane_base["LANE_MEDIAN_D"] = lane_base["LANE_MEDIAN_H"].apply(_round_days_from_hours)
+    lane_base["LANE_PXX_H"] = lane_base["LANE_PXX_H"].apply(_round_hours)
+    lane_base["LANE_PXX_D"] = lane_base["LANE_PXX_H"].apply(_round_days_from_hours)
+
+    merged = valid.merge(
+        lane_base[["TENANT_NAME", "LANE", "LANE_MEDIAN_H"]],
+        on=["TENANT_NAME", "LANE"],
+        how="left",
+    )
+    merged["ABS_DEV_H"] = (merged[metric_col] - merged["LANE_MEDIAN_H"]).abs()
+
+    carrier_rows = []
+    grouped = merged.groupby(["TENANT_NAME", "LANE", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)
+
+    for (tenant, lane, carrier_name, carrier_scac), g in grouped:
+        shipments = int(g["MASTER_SHIPMENT_ID"].nunique())
+        carrier_series = g[metric_col].dropna()
+        dev_series = g["ABS_DEV_H"].dropna()
+
+        carrier_median_h = _round_hours(float(carrier_series.median())) if not carrier_series.empty else None
+        mad_h = _round_hours(float(dev_series.median())) if not dev_series.empty else None
+
+        if percentile_threshold_enabled and shipments < percentile_threshold_value:
+            carrier_pxx_h = None
+            dev_pxx_h = None
+        else:
+            carrier_pxx_h = _round_hours(_safe_quantile(carrier_series, percentile_p / 100.0)) if not carrier_series.empty else None
+            dev_pxx_h = _round_hours(_safe_quantile(dev_series, percentile_p / 100.0)) if not dev_series.empty else None
+
+        eligible = True
+        if rec_threshold_enabled and shipments < rec_threshold_value:
+            eligible = False
+
+        carrier_rows.append(
+            {
+                "TENANT_NAME": tenant,
+                "LANE": lane,
+                "CARRIER_NAME": carrier_name,
+                "CARRIER_SCAC": carrier_scac,
+                "SHIPMENTS": shipments,
+                "CARRIER_MEDIAN_H": carrier_median_h,
+                "CARRIER_MEDIAN_D": _round_days_from_hours(carrier_median_h),
+                "CARRIER_PXX_H": carrier_pxx_h,
+                "CARRIER_PXX_D": _round_days_from_hours(carrier_pxx_h),
+                "MEDIAN_ABS_DEV_H": mad_h,
+                "MEDIAN_ABS_DEV_D": _round_days_from_hours(mad_h),
+                "PXX_ABS_DEV_H": dev_pxx_h,
+                "PXX_ABS_DEV_D": _round_days_from_hours(dev_pxx_h),
+                "RECOMMENDATION_ELIGIBLE": eligible,
+            }
+        )
+
+    carrier_recs = pd.DataFrame(carrier_rows)
+    if carrier_recs.empty:
+        carrier_recs["RANK_IN_LANE"] = pd.Series(dtype="Int64")
+        return lane_base, carrier_recs
+
+    carrier_recs["PXX_ABS_DEV_SORT"] = carrier_recs["PXX_ABS_DEV_H"].fillna(np.inf)
+    carrier_recs["MEDIAN_ABS_DEV_SORT"] = carrier_recs["MEDIAN_ABS_DEV_H"].fillna(np.inf)
+
+    eligible_recs = carrier_recs[carrier_recs["RECOMMENDATION_ELIGIBLE"]].copy()
+    eligible_recs = eligible_recs.sort_values(
+        ["TENANT_NAME", "LANE", "MEDIAN_ABS_DEV_SORT", "PXX_ABS_DEV_SORT", "SHIPMENTS", "CARRIER_NAME"],
+        ascending=[True, True, True, True, False, True],
+    )
+    eligible_recs["RANK_IN_LANE"] = eligible_recs.groupby(["TENANT_NAME", "LANE"], dropna=False).cumcount() + 1
+
+    non_eligible = carrier_recs[~carrier_recs["RECOMMENDATION_ELIGIBLE"]].copy()
+    non_eligible["RANK_IN_LANE"] = pd.NA
+
+    out = pd.concat([eligible_recs, non_eligible], ignore_index=True)
+    out = out.drop(columns=["PXX_ABS_DEV_SORT", "MEDIAN_ABS_DEV_SORT"], errors="ignore")
+
+    lane_summary = lane_base.sort_values(["LANE_SHIPMENTS", "LANE"], ascending=[False, True])
+    carrier_recs = out.sort_values(
+        ["TENANT_NAME", "LANE", "RECOMMENDATION_ELIGIBLE", "RANK_IN_LANE", "SHIPMENTS", "CARRIER_NAME"],
+        ascending=[True, True, False, True, False, True],
+    )
+
+    return lane_summary, carrier_recs
+
+
+def make_lane_selector_labels(lane_summary: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
+    mapping = {}
+    if lane_summary.empty:
+        return mapping
+
+    for _, row in lane_summary.iterrows():
+        label = f"{row['TENANT_NAME']} | {row['LANE']} ({int(row['LANE_SHIPMENTS'])} shipments)"
+        mapping[label] = (row["TENANT_NAME"], row["LANE"])
+    return mapping
+
+
+def get_selected_lane_outputs(
+    shipment_lt: pd.DataFrame,
+    lane_summary: pd.DataFrame,
+    carrier_recs: pd.DataFrame,
+    selected_tenant: str,
+    selected_lane: str,
+    metric_cfg: Dict[str, str],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    metric_col = metric_cfg["data_col"]
+
+    lane_row = lane_summary[(lane_summary["TENANT_NAME"] == selected_tenant) & (lane_summary["LANE"] == selected_lane)].copy()
+    lane_carriers = carrier_recs[(carrier_recs["TENANT_NAME"] == selected_tenant) & (carrier_recs["LANE"] == selected_lane)].copy()
+
+    top5 = lane_carriers[lane_carriers["RECOMMENDATION_ELIGIBLE"]].copy()
+    top5 = top5.sort_values(["RANK_IN_LANE", "SHIPMENTS", "CARRIER_NAME"], ascending=[True, False, True]).head(5)
+
+    carriers_to_plot = top5["CARRIER_NAME"].tolist()
+    ship_subset = shipment_lt[
+        (shipment_lt["TENANT_NAME"] == selected_tenant)
+        & (shipment_lt["LANE"] == selected_lane)
+        & (shipment_lt["CARRIER_NAME"].isin(carriers_to_plot))
+    ][["TENANT_NAME", "LANE", "MASTER_SHIPMENT_ID", "CARRIER_NAME", "CARRIER_SCAC", metric_col]].copy()
+
+    ship_subset = ship_subset.rename(columns={metric_col: "LEAD_TIME_HOURS"})
+    lane_median_h = lane_row["LANE_MEDIAN_H"].iloc[0] if not lane_row.empty else None
+    if lane_median_h is not None and not ship_subset.empty:
+        ship_subset["ABS_DEV_H"] = (ship_subset["LEAD_TIME_HOURS"] - lane_median_h).abs()
+    else:
+        ship_subset["ABS_DEV_H"] = np.nan
+
+    return lane_row, top5, ship_subset
+
+
+def write_insights_excel(
+    lane_summary: pd.DataFrame,
+    carrier_recs: pd.DataFrame,
+    selected_lane_shipments: pd.DataFrame,
+    metric_label: str,
+    percentile_p: int,
+) -> bytes:
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        lane_summary.to_excel(writer, sheet_name="Lane Summary", index=False)
+        carrier_recs.to_excel(writer, sheet_name="Carrier Recommendations", index=False)
+        selected_lane_shipments.to_excel(writer, sheet_name="Selected Lane Shipments", index=False)
+
+        for ws in writer.book.worksheets:
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for idx in range(1, ws.max_column + 1):
+                ws.column_dimensions[get_column_letter(idx)].width = 24
+
+    output.seek(0)
+    return output.getvalue()
 
 
 # ----------------------------
@@ -582,7 +829,6 @@ def write_excel_final(
     from openpyxl.utils import get_column_letter
 
     output = io.BytesIO()
-
     raw_export = add_shipment_month_year(raw_df)
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -624,9 +870,8 @@ def write_excel_final(
                 ws.column_dimensions[get_column_letter(idx)].width = width_map.get(col_name, 24)
 
         ws_raw = writer.book["Raw Data"]
-        bold_font = Font(bold=True)
         for cell in ws_raw[1]:
-            cell.font = bold_font
+            cell.font = Font(bold=True)
 
     output.seek(0)
     return output.getvalue()
@@ -641,9 +886,10 @@ st.title("Ocean Lead Time Analyzer (Carrier + Lane Lead Time)")
 st.markdown(
     """
 Upload a **CSV or Excel** extract. Pick journey **start** and **end** milestones.  
-Output is an **Excel report** with:
+Output includes:
 - **Raw Data**
 - **Carrier Lane Lead**
+- **Insights**
 """
 )
 
@@ -695,7 +941,7 @@ top_n_lanes = st.sidebar.number_input(
 )
 
 st.sidebar.divider()
-st.sidebar.header("Percentile Settings")
+st.sidebar.header("Insights Settings")
 
 include_percentile = st.sidebar.checkbox("Include additional percentile (PXX)", value=True)
 
@@ -715,12 +961,26 @@ limit_by_volume = st.sidebar.checkbox(
 )
 
 min_volume = st.sidebar.number_input(
-    "Min volume threshold",
+    "Percentile volume threshold",
     min_value=0,
     max_value=10_000_000,
     value=10,
     step=1,
     disabled=(not include_percentile) or (not limit_by_volume),
+)
+
+recommendation_threshold_enabled = st.sidebar.checkbox(
+    "Only generate recommendations if volume ≥ threshold",
+    value=False,
+)
+
+recommendation_threshold_value = st.sidebar.number_input(
+    "Recommendation volume threshold",
+    min_value=0,
+    max_value=10_000_000,
+    value=DEFAULT_RECOMMENDATION_THRESHOLD,
+    step=1,
+    disabled=not recommendation_threshold_enabled,
 )
 
 min_volume_for_pct = int(min_volume) if (include_percentile and limit_by_volume) else 0
@@ -734,9 +994,7 @@ missing_cols = get_missing_columns(
 )
 
 if missing_cols:
-    st.error(
-        "The uploaded file is missing required columns:\n\n- " + "\n- ".join(missing_cols)
-    )
+    st.error("The uploaded file is missing required columns:\n\n- " + "\n- ".join(missing_cols))
     st.stop()
 
 # Compute shipment-level data
@@ -799,7 +1057,14 @@ st.download_button(
 # Shipment preview
 st.subheader("Shipment-level lead times (preview)")
 preview_cols = [
-    "TENANT_NAME", "MASTER_SHIPMENT_ID", "POL", "POD", "LANE", "CARRIER_NAME", "CARRIER_SCAC", "JOURNEY_LEAD_HOURS"
+    "TENANT_NAME",
+    "MASTER_SHIPMENT_ID",
+    "POL",
+    "POD",
+    "LANE",
+    "CARRIER_NAME",
+    "CARRIER_SCAC",
+    _journey_col_name(),
 ]
 if whole_journey:
     preview_cols.extend([_segment_col_name(a, b) for a, b in SEGMENTS])
@@ -835,5 +1100,178 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
+# Insights trigger
+if "show_insights" not in st.session_state:
+    st.session_state["show_insights"] = False
+
 if st.button("Generate Insights"):
-    st.info("Generate Insights is added as a placeholder. Share the insight logic next, and we’ll wire it in.")
+    st.session_state["show_insights"] = True
+
+if st.session_state["show_insights"]:
+    st.subheader("Insights")
+
+    insight_options = build_insight_options(duration_configs)
+    default_metric_label = f"{start_ms}-{end_ms}" if f"{start_ms}-{end_ms}" in insight_options else list(insight_options.keys())[0]
+
+    selected_metric_label = st.selectbox(
+        "Choose journey part for insights",
+        options=list(insight_options.keys()),
+        index=list(insight_options.keys()).index(default_metric_label),
+    )
+
+    selected_metric_cfg = insight_options[selected_metric_label]
+
+    lane_summary_df, carrier_recs_df = compute_insights_for_metric(
+        shipment_lt=shipment_lt,
+        metric_cfg=selected_metric_cfg,
+        percentile_p=int(percentile_p),
+        percentile_threshold_enabled=bool(include_percentile and limit_by_volume),
+        percentile_threshold_value=int(min_volume_for_pct),
+        rec_threshold_enabled=bool(recommendation_threshold_enabled),
+        rec_threshold_value=int(recommendation_threshold_value),
+    )
+
+    lane_mapping = make_lane_selector_labels(lane_summary_df)
+
+    if not lane_mapping:
+        st.warning("No insight data available for the selected settings.")
+    else:
+        lane_labels = list(lane_mapping.keys())
+        selected_lane_label = st.selectbox(
+            "Choose lane",
+            options=lane_labels,
+            index=0,
+        )
+        selected_tenant, selected_lane = lane_mapping[selected_lane_label]
+
+        lane_row, top5_df, selected_lane_shipments = get_selected_lane_outputs(
+            shipment_lt=shipment_lt,
+            lane_summary=lane_summary_df,
+            carrier_recs=carrier_recs_df,
+            selected_tenant=selected_tenant,
+            selected_lane=selected_lane,
+            metric_cfg=selected_metric_cfg,
+        )
+
+        if lane_row.empty:
+            st.warning("No lane summary available for the selected lane.")
+        else:
+            lane_info = lane_row.iloc[0]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Lane Shipments", f"{int(lane_info['LANE_SHIPMENTS']):,}")
+            c2.metric("Carriers in Lane", f"{int(lane_info['CARRIER_COUNT']):,}")
+            c3.metric("Lane Median", f"{lane_info['LANE_MEDIAN_D']} d" if pd.notna(lane_info["LANE_MEDIAN_D"]) else "N/A")
+            c4.metric(
+                f"Lane P{int(percentile_p)}",
+                f"{lane_info['LANE_PXX_D']} d" if pd.notna(lane_info["LANE_PXX_D"]) else "N/A",
+            )
+
+            st.caption(
+                "Recommendations are ranked by lowest deviation from the lane median, "
+                "then lowest percentile deviation, then higher shipment volume."
+            )
+
+            display_top5 = top5_df[
+                [
+                    "RANK_IN_LANE",
+                    "CARRIER_NAME",
+                    "CARRIER_SCAC",
+                    "SHIPMENTS",
+                    "CARRIER_MEDIAN_H",
+                    "CARRIER_MEDIAN_D",
+                    "CARRIER_PXX_H",
+                    "CARRIER_PXX_D",
+                    "MEDIAN_ABS_DEV_H",
+                    "MEDIAN_ABS_DEV_D",
+                    "PXX_ABS_DEV_H",
+                    "PXX_ABS_DEV_D",
+                ]
+            ].copy()
+
+            display_top5 = display_top5.rename(
+                columns={
+                    "RANK_IN_LANE": "Rank",
+                    "CARRIER_NAME": "Carrier Name",
+                    "CARRIER_SCAC": "Carrier SCAC",
+                    "SHIPMENTS": "Shipments",
+                    "CARRIER_MEDIAN_H": "Carrier Median (Hours)",
+                    "CARRIER_MEDIAN_D": "Carrier Median (Days)",
+                    "CARRIER_PXX_H": f"Carrier P{int(percentile_p)} (Hours)",
+                    "CARRIER_PXX_D": f"Carrier P{int(percentile_p)} (Days)",
+                    "MEDIAN_ABS_DEV_H": "Median Abs Deviation (Hours)",
+                    "MEDIAN_ABS_DEV_D": "Median Abs Deviation (Days)",
+                    "PXX_ABS_DEV_H": f"P{int(percentile_p)} Abs Deviation (Hours)",
+                    "PXX_ABS_DEV_D": f"P{int(percentile_p)} Abs Deviation (Days)",
+                }
+            )
+
+            st.markdown("**Top 5 Recommended Carriers**")
+            st.dataframe(display_top5, use_container_width=True)
+
+            if not top5_df.empty:
+                # Bar chart
+                bar_df = top5_df.copy()
+                bar_df["Carrier Label"] = bar_df["CARRIER_NAME"].astype(str) + " (" + bar_df["CARRIER_SCAC"].fillna("").astype(str) + ")"
+
+                fig_bar = px.bar(
+                    bar_df.sort_values(["RANK_IN_LANE"]),
+                    x="Carrier Label",
+                    y="MEDIAN_ABS_DEV_H",
+                    hover_data={
+                        "SHIPMENTS": True,
+                        "CARRIER_MEDIAN_H": True,
+                        "CARRIER_PXX_H": True,
+                        "PXX_ABS_DEV_H": True,
+                        "Carrier Label": False,
+                        "MEDIAN_ABS_DEV_H": True,
+                    },
+                    labels={
+                        "Carrier Label": "Carrier",
+                        "MEDIAN_ABS_DEV_H": "Median Absolute Deviation (Hours)",
+                    },
+                    title=f"Deviation Ranking: {selected_metric_label} | {selected_lane}",
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+                # Box plot
+                if not selected_lane_shipments.empty:
+                    ship_plot = selected_lane_shipments.copy()
+                    carrier_order = top5_df["CARRIER_NAME"].tolist()
+                    ship_plot["CARRIER_NAME"] = pd.Categorical(ship_plot["CARRIER_NAME"], categories=carrier_order, ordered=True)
+                    ship_plot = ship_plot.sort_values("CARRIER_NAME")
+
+                    lane_median_h = lane_info["LANE_MEDIAN_H"]
+                    fig_box = px.box(
+                        ship_plot,
+                        x="CARRIER_NAME",
+                        y="LEAD_TIME_HOURS",
+                        points="outliers",
+                        labels={
+                            "CARRIER_NAME": "Carrier",
+                            "LEAD_TIME_HOURS": f"{selected_metric_label} Lead Time (Hours)",
+                        },
+                        title=f"Lead Time Distribution by Carrier: {selected_metric_label} | {selected_lane}",
+                    )
+                    if pd.notna(lane_median_h):
+                        fig_box.add_hline(
+                            y=lane_median_h,
+                            line_dash="dash",
+                            annotation_text=f"Lane Median: {lane_median_h} h",
+                        )
+                    st.plotly_chart(fig_box, use_container_width=True)
+
+            insights_excel = write_insights_excel(
+                lane_summary=lane_summary_df,
+                carrier_recs=carrier_recs_df,
+                selected_lane_shipments=selected_lane_shipments,
+                metric_label=selected_metric_label,
+                percentile_p=int(percentile_p),
+            )
+
+            safe_metric_label = selected_metric_label.replace(" ", "_").replace(">", "").replace("<", "")
+            st.download_button(
+                label="Download Insights Excel",
+                data=insights_excel,
+                file_name=f"insights_{safe_metric_label}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
