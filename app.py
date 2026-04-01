@@ -5,7 +5,6 @@ from typing import Dict, Optional, List, Tuple
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -53,7 +52,8 @@ DISPLAY_COLS = {
     "MAX_D": "Max Lead Time (Days)",
 }
 
-DEFAULT_RECOMMENDATION_THRESHOLD = 0
+DEFAULT_PERCENTILE_VOLUME_THRESHOLD_PCT = 0.0
+DEFAULT_RECOMMENDATION_VOLUME_THRESHOLD_PCT = 0.0
 
 
 # ----------------------------
@@ -171,6 +171,18 @@ def _segment_label(start_ms: str, end_ms: str) -> str:
 
 def _journey_col_name() -> str:
     return "JOURNEY_LEAD_HOURS"
+
+
+def _pct_to_count(total_shipments: int, threshold_pct: float) -> int:
+    """
+    Convert percentage threshold to minimum shipment count.
+    Example:
+      total = 1000, pct = 10 -> 100
+      total = 83, pct = 10 -> 9
+    """
+    if total_shipments <= 0 or threshold_pct <= 0:
+        return 0
+    return int(np.ceil(total_shipments * (threshold_pct / 100.0)))
 
 
 # ----------------------------
@@ -524,20 +536,33 @@ def compute_insights_for_metric(
     metric_cfg: Dict[str, str],
     percentile_p: int,
     percentile_threshold_enabled: bool,
-    percentile_threshold_value: int,
+    percentile_threshold_pct: float,
     rec_threshold_enabled: bool,
-    rec_threshold_value: int,
+    rec_threshold_pct: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns:
       lane_summary_df
       carrier_recommendations_df
+
+    Thresholds are percentage-based within each lane.
     """
     metric_col = metric_cfg["data_col"]
 
     if shipment_lt.empty or metric_col not in shipment_lt.columns:
         lane_summary = pd.DataFrame(
-            columns=["TENANT_NAME", "LANE", "LANE_SHIPMENTS", "LANE_MEDIAN_H", "LANE_MEDIAN_D", "LANE_PXX_H", "LANE_PXX_D", "CARRIER_COUNT"]
+            columns=[
+                "TENANT_NAME",
+                "LANE",
+                "LANE_SHIPMENTS",
+                "LANE_MEDIAN_H",
+                "LANE_MEDIAN_D",
+                "LANE_PXX_H",
+                "LANE_PXX_D",
+                "CARRIER_COUNT",
+                "PERCENTILE_MIN_SHIPMENTS_REQUIRED",
+                "RECOMMENDATION_MIN_SHIPMENTS_REQUIRED",
+            ]
         )
         carrier_recs = pd.DataFrame(
             columns=[
@@ -546,6 +571,7 @@ def compute_insights_for_metric(
                 "CARRIER_NAME",
                 "CARRIER_SCAC",
                 "SHIPMENTS",
+                "CARRIER_SHARE_PCT",
                 "CARRIER_MEDIAN_H",
                 "CARRIER_MEDIAN_D",
                 "CARRIER_PXX_H",
@@ -556,6 +582,9 @@ def compute_insights_for_metric(
                 "PXX_ABS_DEV_D",
                 "RANK_IN_LANE",
                 "RECOMMENDATION_ELIGIBLE",
+                "PERCENTILE_ELIGIBLE",
+                "PERCENTILE_MIN_SHIPMENTS_REQUIRED",
+                "RECOMMENDATION_MIN_SHIPMENTS_REQUIRED",
             ]
         )
         return lane_summary, carrier_recs
@@ -567,9 +596,9 @@ def compute_insights_for_metric(
             metric_cfg,
             percentile_p,
             percentile_threshold_enabled,
-            percentile_threshold_value,
+            percentile_threshold_pct,
             rec_threshold_enabled,
-            rec_threshold_value,
+            rec_threshold_pct,
         )
 
     lane_base = (
@@ -582,32 +611,30 @@ def compute_insights_for_metric(
         .reset_index()
     )
 
-    if percentile_threshold_enabled:
-        lane_base["LANE_PXX_H"] = lane_base.apply(
-            lambda r: _safe_quantile(
-                valid[(valid["TENANT_NAME"] == r["TENANT_NAME"]) & (valid["LANE"] == r["LANE"])][metric_col],
-                percentile_p / 100.0,
-            )
-            if r["LANE_SHIPMENTS"] >= percentile_threshold_value
-            else None,
-            axis=1,
-        )
-    else:
-        lane_base["LANE_PXX_H"] = lane_base.apply(
-            lambda r: _safe_quantile(
-                valid[(valid["TENANT_NAME"] == r["TENANT_NAME"]) & (valid["LANE"] == r["LANE"])][metric_col],
-                percentile_p / 100.0,
-            ),
-            axis=1,
-        )
+    lane_base["PERCENTILE_MIN_SHIPMENTS_REQUIRED"] = lane_base["LANE_SHIPMENTS"].apply(
+        lambda x: _pct_to_count(int(x), float(percentile_threshold_pct)) if percentile_threshold_enabled else 0
+    )
+    lane_base["RECOMMENDATION_MIN_SHIPMENTS_REQUIRED"] = lane_base["LANE_SHIPMENTS"].apply(
+        lambda x: _pct_to_count(int(x), float(rec_threshold_pct)) if rec_threshold_enabled else 0
+    )
 
+    lane_pxx_rows = []
+    for _, row in lane_base.iterrows():
+        sub = valid[(valid["TENANT_NAME"] == row["TENANT_NAME"]) & (valid["LANE"] == row["LANE"])][metric_col]
+        if percentile_threshold_enabled and int(row["LANE_SHIPMENTS"]) < int(row["PERCENTILE_MIN_SHIPMENTS_REQUIRED"]):
+            lane_pxx = None
+        else:
+            lane_pxx = _safe_quantile(sub, percentile_p / 100.0)
+        lane_pxx_rows.append(lane_pxx)
+
+    lane_base["LANE_PXX_H"] = lane_pxx_rows
     lane_base["LANE_MEDIAN_H"] = lane_base["LANE_MEDIAN_H"].apply(_round_hours)
     lane_base["LANE_MEDIAN_D"] = lane_base["LANE_MEDIAN_H"].apply(_round_days_from_hours)
     lane_base["LANE_PXX_H"] = lane_base["LANE_PXX_H"].apply(_round_hours)
     lane_base["LANE_PXX_D"] = lane_base["LANE_PXX_H"].apply(_round_days_from_hours)
 
     merged = valid.merge(
-        lane_base[["TENANT_NAME", "LANE", "LANE_MEDIAN_H"]],
+        lane_base[["TENANT_NAME", "LANE", "LANE_MEDIAN_H", "LANE_SHIPMENTS", "PERCENTILE_MIN_SHIPMENTS_REQUIRED", "RECOMMENDATION_MIN_SHIPMENTS_REQUIRED"]],
         on=["TENANT_NAME", "LANE"],
         how="left",
     )
@@ -618,22 +645,27 @@ def compute_insights_for_metric(
 
     for (tenant, lane, carrier_name, carrier_scac), g in grouped:
         shipments = int(g["MASTER_SHIPMENT_ID"].nunique())
+        lane_shipments = int(g["LANE_SHIPMENTS"].iloc[0]) if not g.empty else 0
+        carrier_share_pct = round((shipments / lane_shipments * 100.0), 2) if lane_shipments > 0 else None
+
+        pct_min_shipments = int(g["PERCENTILE_MIN_SHIPMENTS_REQUIRED"].iloc[0]) if not g.empty else 0
+        rec_min_shipments = int(g["RECOMMENDATION_MIN_SHIPMENTS_REQUIRED"].iloc[0]) if not g.empty else 0
+
         carrier_series = g[metric_col].dropna()
         dev_series = g["ABS_DEV_H"].dropna()
 
         carrier_median_h = _round_hours(float(carrier_series.median())) if not carrier_series.empty else None
         mad_h = _round_hours(float(dev_series.median())) if not dev_series.empty else None
 
-        if percentile_threshold_enabled and shipments < percentile_threshold_value:
-            carrier_pxx_h = None
-            dev_pxx_h = None
-        else:
+        percentile_eligible = not percentile_threshold_enabled or shipments >= pct_min_shipments
+        recommendation_eligible = not rec_threshold_enabled or shipments >= rec_min_shipments
+
+        if percentile_eligible:
             carrier_pxx_h = _round_hours(_safe_quantile(carrier_series, percentile_p / 100.0)) if not carrier_series.empty else None
             dev_pxx_h = _round_hours(_safe_quantile(dev_series, percentile_p / 100.0)) if not dev_series.empty else None
-
-        eligible = True
-        if rec_threshold_enabled and shipments < rec_threshold_value:
-            eligible = False
+        else:
+            carrier_pxx_h = None
+            dev_pxx_h = None
 
         carrier_rows.append(
             {
@@ -642,6 +674,7 @@ def compute_insights_for_metric(
                 "CARRIER_NAME": carrier_name,
                 "CARRIER_SCAC": carrier_scac,
                 "SHIPMENTS": shipments,
+                "CARRIER_SHARE_PCT": carrier_share_pct,
                 "CARRIER_MEDIAN_H": carrier_median_h,
                 "CARRIER_MEDIAN_D": _round_days_from_hours(carrier_median_h),
                 "CARRIER_PXX_H": carrier_pxx_h,
@@ -650,7 +683,10 @@ def compute_insights_for_metric(
                 "MEDIAN_ABS_DEV_D": _round_days_from_hours(mad_h),
                 "PXX_ABS_DEV_H": dev_pxx_h,
                 "PXX_ABS_DEV_D": _round_days_from_hours(dev_pxx_h),
-                "RECOMMENDATION_ELIGIBLE": eligible,
+                "RECOMMENDATION_ELIGIBLE": recommendation_eligible,
+                "PERCENTILE_ELIGIBLE": percentile_eligible,
+                "PERCENTILE_MIN_SHIPMENTS_REQUIRED": pct_min_shipments,
+                "RECOMMENDATION_MIN_SHIPMENTS_REQUIRED": rec_min_shipments,
             }
         )
 
@@ -732,8 +768,6 @@ def write_insights_excel(
     lane_summary: pd.DataFrame,
     carrier_recs: pd.DataFrame,
     selected_lane_shipments: pd.DataFrame,
-    metric_label: str,
-    percentile_p: int,
 ) -> bytes:
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
@@ -955,35 +989,33 @@ percentile_p = st.sidebar.number_input(
 )
 
 limit_by_volume = st.sidebar.checkbox(
-    "Only compute percentile if volume ≥ threshold",
+    "Only compute percentile if carrier volume share ≥ threshold (%)",
     value=False,
     disabled=not include_percentile,
 )
 
-min_volume = st.sidebar.number_input(
-    "Percentile volume threshold",
-    min_value=0,
-    max_value=10_000_000,
-    value=10,
-    step=1,
+percentile_volume_threshold_pct = st.sidebar.number_input(
+    "Percentile volume threshold (%)",
+    min_value=0.0,
+    max_value=100.0,
+    value=float(DEFAULT_PERCENTILE_VOLUME_THRESHOLD_PCT),
+    step=1.0,
     disabled=(not include_percentile) or (not limit_by_volume),
 )
 
 recommendation_threshold_enabled = st.sidebar.checkbox(
-    "Only generate recommendations if volume ≥ threshold",
+    "Only generate recommendations if carrier volume share ≥ threshold (%)",
     value=False,
 )
 
-recommendation_threshold_value = st.sidebar.number_input(
-    "Recommendation volume threshold",
-    min_value=0,
-    max_value=10_000_000,
-    value=DEFAULT_RECOMMENDATION_THRESHOLD,
-    step=1,
+recommendation_threshold_pct = st.sidebar.number_input(
+    "Recommendation volume threshold (%)",
+    min_value=0.0,
+    max_value=100.0,
+    value=float(DEFAULT_RECOMMENDATION_VOLUME_THRESHOLD_PCT),
+    step=1.0,
     disabled=not recommendation_threshold_enabled,
 )
-
-min_volume_for_pct = int(min_volume) if (include_percentile and limit_by_volume) else 0
 
 # Validation
 missing_cols = get_missing_columns(
@@ -1075,11 +1107,14 @@ st.dataframe(shipment_lt[preview_cols].head(200), use_container_width=True)
 # Final report
 duration_configs = build_duration_configs(start_ms=start_ms, end_ms=end_ms, whole_journey=whole_journey)
 
+# For the carrier-lane report, the threshold remains count-based.
+# We convert the current percentage threshold against each lane only in insights.
+# So here we keep report percentile threshold as 0 if user selected percentage-based logic.
 report_df = build_carrier_lane_report(
     shipment_lt=shipment_lt,
     percentile_p=int(percentile_p),
     include_percentile=bool(include_percentile),
-    min_volume_for_percentile=int(min_volume_for_pct),
+    min_volume_for_percentile=0,
     duration_configs=duration_configs,
 )
 
@@ -1126,9 +1161,9 @@ if st.session_state["show_insights"]:
         metric_cfg=selected_metric_cfg,
         percentile_p=int(percentile_p),
         percentile_threshold_enabled=bool(include_percentile and limit_by_volume),
-        percentile_threshold_value=int(min_volume_for_pct),
+        percentile_threshold_pct=float(percentile_volume_threshold_pct),
         rec_threshold_enabled=bool(recommendation_threshold_enabled),
-        rec_threshold_value=int(recommendation_threshold_value),
+        rec_threshold_pct=float(recommendation_threshold_pct),
     )
 
     lane_mapping = make_lane_selector_labels(lane_summary_df)
@@ -1168,7 +1203,8 @@ if st.session_state["show_insights"]:
 
             st.caption(
                 "Recommendations are ranked by lowest deviation from the lane median, "
-                "then lowest percentile deviation, then higher shipment volume."
+                "then lowest percentile deviation, then higher shipment volume. "
+                "Thresholds are applied as carrier share % of total shipments in the selected lane."
             )
 
             display_top5 = top5_df[
@@ -1177,6 +1213,7 @@ if st.session_state["show_insights"]:
                     "CARRIER_NAME",
                     "CARRIER_SCAC",
                     "SHIPMENTS",
+                    "CARRIER_SHARE_PCT",
                     "CARRIER_MEDIAN_H",
                     "CARRIER_MEDIAN_D",
                     "CARRIER_PXX_H",
@@ -1194,6 +1231,7 @@ if st.session_state["show_insights"]:
                     "CARRIER_NAME": "Carrier Name",
                     "CARRIER_SCAC": "Carrier SCAC",
                     "SHIPMENTS": "Shipments",
+                    "CARRIER_SHARE_PCT": "Carrier Share (%)",
                     "CARRIER_MEDIAN_H": "Carrier Median (Hours)",
                     "CARRIER_MEDIAN_D": "Carrier Median (Days)",
                     "CARRIER_PXX_H": f"Carrier P{int(percentile_p)} (Hours)",
@@ -1209,7 +1247,6 @@ if st.session_state["show_insights"]:
             st.dataframe(display_top5, use_container_width=True)
 
             if not top5_df.empty:
-                # Bar chart
                 bar_df = top5_df.copy()
                 bar_df["Carrier Label"] = bar_df["CARRIER_NAME"].astype(str) + " (" + bar_df["CARRIER_SCAC"].fillna("").astype(str) + ")"
 
@@ -1219,6 +1256,7 @@ if st.session_state["show_insights"]:
                     y="MEDIAN_ABS_DEV_H",
                     hover_data={
                         "SHIPMENTS": True,
+                        "CARRIER_SHARE_PCT": True,
                         "CARRIER_MEDIAN_H": True,
                         "CARRIER_PXX_H": True,
                         "PXX_ABS_DEV_H": True,
@@ -1233,7 +1271,6 @@ if st.session_state["show_insights"]:
                 )
                 st.plotly_chart(fig_bar, use_container_width=True)
 
-                # Box plot
                 if not selected_lane_shipments.empty:
                     ship_plot = selected_lane_shipments.copy()
                     carrier_order = top5_df["CARRIER_NAME"].tolist()
@@ -1264,8 +1301,6 @@ if st.session_state["show_insights"]:
                 lane_summary=lane_summary_df,
                 carrier_recs=carrier_recs_df,
                 selected_lane_shipments=selected_lane_shipments,
-                metric_label=selected_metric_label,
-                percentile_p=int(percentile_p),
             )
 
             safe_metric_label = selected_metric_label.replace(" ", "_").replace(">", "").replace("<", "")
